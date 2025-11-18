@@ -1,0 +1,14 @@
+[
+  "age_years",
+  "sex",
+  "cough_weeks",
+  "fever",
+  "night_sweats",
+  "contact_TB",
+  "HIV_positive",
+  "weight_zscore",
+  "malnutrition",
+  "BCG_scar",
+  "CXR_abnormal",
+  "GeneXpert_available"
+]

@@ -1,0 +1,19 @@
+
+=== FINAL MODEL SUMMARY ===
+Chosen model        : XGBoost (calibrated)
+Validation AUROC    : 0.723
+Test AUROC          : 0.743
+Test AUPRC          : 0.441
+Sensitivity (test)  : 0.942
+Specificity (test)  : 0.237
+
+Subgroup performance (AUROC):
+  Age 0-5           : 0.751
+  Age 6-10          : 0.699
+  Age 11-15         : 0.761
+  HIV+              : 0.712
+  Malnutrition      : 0.721
+  Female            : 0.727
+  Male              : 0.768
+
+Notes: Model calibrated with isotonic regression and threshold tuned using Youden’s J with sensitivity ≥ 0.85.

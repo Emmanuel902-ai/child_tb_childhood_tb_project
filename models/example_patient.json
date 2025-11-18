@@ -1,0 +1,14 @@
+{
+  "age_years": 7,
+  "sex": 0,
+  "cough_weeks": 3,
+  "fever": 1,
+  "night_sweats": 1,
+  "contact_TB": 1,
+  "HIV_positive": 0,
+  "weight_zscore": -2.0,
+  "malnutrition": 1,
+  "BCG_scar": 1,
+  "CXR_abnormal": 1,
+  "GeneXpert_available": 0
+}
