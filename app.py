@@ -81,8 +81,10 @@ def predict_risk(model, X_row):
 
 
 def interpret_risk(prob):
-    if prob < 0.2: return "Low risk profile"
-    if prob < 0.5: return "Moderate risk profile"
+    if prob < 0.2:
+        return "Low risk profile"
+    if prob < 0.5:
+        return "Moderate risk profile"
     return "High risk profile"
 
 
