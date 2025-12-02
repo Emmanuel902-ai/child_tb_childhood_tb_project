@@ -1,495 +1,600 @@
 import os
 import json
 import pickle
+import logging
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
 import streamlit as st
+import xgboost as xgb
 
 # -------------------------------------------------------------------
-# Paths and artifact loading
+# Paths, logging, and artifact loading
 # -------------------------------------------------------------------
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(BASE_DIR, "models")
 FIG_DIR = os.path.join(BASE_DIR, "figures")
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+# Basic logging configuration
+logging.basicConfig(
+    filename=os.path.join(LOG_DIR, "app.log"),
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 
 @st.cache_resource
 def load_artifacts():
     """
-    Load the calibrated model, feature order, classification threshold,
-    example patient profile, and textual results summary.
-
-    Raises a clear Streamlit error if required artifacts are missing.
+    Load model, feature order, classification threshold,
+    example patient profile, and results summary.
     """
+
     # Load calibrated model
     model_path = os.path.join(MODELS_DIR, "calibrated_xgb.pkl")
     if not os.path.exists(model_path):
-        st.error(
-            f"Missing model file: {model_path}. "
-            "Please ensure the trained calibrated_xgb.pkl is available "
-            "in the 'models' directory."
-        )
+        st.error(f"Missing model file: {model_path}")
         st.stop()
 
     with open(model_path, "rb") as f:
         calibrated_model = pickle.load(f)
+    logger.info("Loaded calibrated model from %s", model_path)
 
-    # Load feature order
+    # Feature order
     feat_path = os.path.join(MODELS_DIR, "feature_order.json")
     if not os.path.exists(feat_path):
-        st.error(
-            f"Missing feature order file: {feat_path}. "
-            "Please ensure feature_order.json is available in the 'models' directory."
-        )
+        st.error(f"Missing feature order file: {feat_path}")
         st.stop()
 
     with open(feat_path, "r") as f:
         feature_order = json.load(f)
+    logger.info("Loaded feature order with %d features.", len(feature_order))
 
-    # Load decision threshold
+    # Threshold
     thr_path = os.path.join(MODELS_DIR, "threshold.json")
     if not os.path.exists(thr_path):
-        st.error(
-            f"Missing threshold file: {thr_path}. "
-            "Please ensure threshold.json is available in the 'models' directory."
-        )
+        st.error(f"Missing threshold file: {thr_path}")
         st.stop()
 
     with open(thr_path, "r") as f:
         thr_data = json.load(f)
     threshold = float(thr_data["threshold"])
+    logger.info("Loaded operating threshold: %.4f", threshold)
 
-    # Load example patient (for defaults in the UI)
+    # Example patient
     example_path = os.path.join(MODELS_DIR, "example_patient.json")
     if not os.path.exists(example_path):
-        st.error(
-            f"Missing example patient file: {example_path}. "
-            "Please ensure example_patient.json is available in the 'models' directory."
-        )
+        st.error(f"Missing example patient file: {example_path}")
         st.stop()
 
     with open(example_path, "r") as f:
         example_patient = json.load(f)
+    logger.info("Loaded example patient defaults.")
 
-    # Load text summary (optional)
+    # Optional text summary
     summary_path = os.path.join(BASE_DIR, "results_summary.txt")
     summary_text = None
     if os.path.exists(summary_path):
         with open(summary_path, "r") as f:
             summary_text = f.read()
+        logger.info("Loaded results_summary.txt.")
+    else:
+        logger.warning("results_summary.txt not found.")
 
     return calibrated_model, feature_order, threshold, example_patient, summary_text
 
 
 # -------------------------------------------------------------------
-# Helper functions: input construction and prediction
+# Helpers
 # -------------------------------------------------------------------
 
-def build_input_df(user_inputs: dict, feature_order):
-    """
-    Convert a dictionary of user inputs to a single-row DataFrame
-    with columns in the correct model feature order.
-    """
-    data = {col: [user_inputs.get(col)] for col in feature_order}
-    return pd.DataFrame(data)
+def build_input_df(user_inputs, feature_order):
+    """Create a DataFrame in correct feature order."""
+    return pd.DataFrame({f: [user_inputs.get(f)] for f in feature_order})
 
 
-def predict_risk(model, X_row: pd.DataFrame) -> float:
-    """
-    Return the predicted probability of tuberculosis (float in [0, 1]).
-    """
+def predict_risk(model, X_row):
+    """Return predicted probability."""
     proba = model.predict_proba(X_row)[:, 1][0]
     return float(proba)
 
 
-def interpret_risk(prob: float) -> str:
-    """
-    Provide a simple textual interpretation of the predicted risk.
-    """
+def interpret_risk(prob):
+    """Human-readable risk interpretation."""
     if prob < 0.2:
         return "Low risk profile"
     elif prob < 0.5:
         return "Moderate risk profile"
+    return "High risk profile"
+
+
+def risk_band(prob):
+    """Return (band_label, colour) for use in UI."""
+    if prob < 0.2:
+        return "Low", "#198754"  # green
+    elif prob < 0.5:
+        return "Moderate", "#ffc107"  # amber
+    return "High", "#dc3545"  # red
+
+
+def log_prediction(user_inputs, prob, label, threshold):
+    """
+    Append a simple audit record to logs/predictions.csv
+    (timestamp, inputs, prob, label).
+    """
+    record = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "probability": prob,
+        "label": label,
+        "threshold": threshold,
+    }
+    # Flatten inputs
+    for k, v in user_inputs.items():
+        record[k] = v
+
+    csv_path = os.path.join(LOG_DIR, "predictions.csv")
+    df_row = pd.DataFrame([record])
+    if os.path.exists(csv_path):
+        df_row.to_csv(csv_path, mode="a", header=False, index=False)
     else:
-        return "High risk profile"
+        df_row.to_csv(csv_path, index=False)
+    logger.info(
+        "Logged prediction: label=%s, prob=%.4f (threshold=%.4f)",
+        label,
+        prob,
+        threshold,
+    )
+
+
+def get_underlying_xgb(model):
+    """
+    Try to recover the underlying XGBClassifier from a calibrated model.
+    If this fails, return None and skip explanations.
+    """
+    try:
+        # Typical structure: CalibratedClassifierCV -> calibrated_classifiers_[0].base_estimator
+        if hasattr(model, "calibrated_classifiers_"):
+            return model.calibrated_classifiers_[0].base_estimator
+        # Fallback: direct estimator
+        if hasattr(model, "base_estimator"):
+            return model.base_estimator
+    except Exception as e:
+        logger.warning("Could not extract underlying XGB model: %s", e)
+    return None
+
+
+def shap_like_contributions(xgb_model, X_row, feature_order):
+    """
+    Use XGBoost's pred_contribs=True to obtain SHAP-like contributions
+    without requiring the external shap package.
+
+    Returns a sorted DataFrame with columns: feature, contribution.
+    """
+    try:
+        dmatrix = xgb.DMatrix(X_row[feature_order])
+        contribs = xgb_model.get_booster().predict(dmatrix, pred_contribs=True)
+        contribs = contribs[0]  # single row
+        feature_contribs = contribs[:-1]  # last term is bias
+        df_contrib = pd.DataFrame(
+            {"feature": feature_order, "contribution": feature_contribs}
+        )
+        df_contrib["abs_contribution"] = df_contrib["contribution"].abs()
+        df_contrib = df_contrib.sort_values("abs_contribution", ascending=False)
+        return df_contrib
+    except Exception as e:
+        logger.warning("Failed to compute SHAP-like contributions: %s", e)
+        return None
+
+
+def build_html_report(user_inputs, prob, label, threshold, interpretation):
+    """
+    Build a simple HTML report for one patient.
+    The user can download this and export to PDF via browser.
+    """
+    rows = "".join(
+        f"<tr><td>{k}</td><td>{v}</td></tr>" for k, v in user_inputs.items()
+    )
+    html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Childhood TB Risk Report</title>
+<style>
+body {{
+    font-family: Arial, sans-serif;
+    margin: 24px;
+}}
+h1 {{
+    color: #005eb8;
+}}
+table {{
+    border-collapse: collapse;
+    width: 100%;
+    margin-top: 16px;
+}}
+th, td {{
+    border: 1px solid #ccc;
+    padding: 8px;
+    font-size: 12px;
+}}
+th {{
+    background-color: #f5f5f5;
+}}
+.summary {{
+    border: 1px solid #005eb8;
+    padding: 12px;
+    margin-top: 16px;
+}}
+</style>
+</head>
+<body>
+<h1>Childhood Tuberculosis Risk Report</h1>
+<div class="summary">
+  <p><strong>Predicted probability of TB:</strong> {prob*100:.1f}%</p>
+  <p><strong>Model decision (threshold {threshold:.3f}):</strong> {label}</p>
+  <p><strong>Risk interpretation:</strong> {interpretation}</p>
+</div>
+
+<h2>Clinical input summary</h2>
+<table>
+  <tr><th>Variable</th><th>Value</th></tr>
+  {rows}
+</table>
+
+<p style="margin-top: 24px; font-size: 11px; color: #666;">
+This report is generated from a research prototype trained on synthetic data.
+It is not intended for clinical use or individual patient management.
+</p>
+</body>
+</html>
+"""
+    return html
 
 
 # -------------------------------------------------------------------
-# Page 1: Overview
+# Overview page
 # -------------------------------------------------------------------
 
-def page_overview(threshold: float):
+def page_overview(threshold):
     st.title("Childhood Tuberculosis Risk Prediction Prototype")
 
-    st.markdown(
-        """
-This web application presents a research prototype for **clinical risk prediction**
-in **childhood pulmonary tuberculosis (TB)** using routine clinical and epidemiological
-data for children aged 0–15 years.
+    st.markdown("""
+This application presents a research prototype demonstrating calibrated
+machine learning–based risk prediction for **childhood pulmonary tuberculosis**
+using routine clinical and epidemiological data (ages 0–15).
+""")
 
-The system operates on a **synthetic dataset** designed to reflect the distributions
-of key risk factors described in international childhood TB guidance. It is intended
-to demonstrate how calibrated machine learning models could support structured
-clinical decision-making in high-burden settings.
-        """
-    )
-
-    st.subheader("Scope and intent of this prototype")
-    st.markdown(
-        f"""
-- Developed using a **synthetic cohort** of approximately 1 500 children with
-  WHO-inspired feature distributions  
-- Trains and evaluates several models, selecting a **calibrated XGBoost classifier**  
-- Chooses an operating **decision threshold of approximately {threshold:.3f}**
-  to prioritise high sensitivity  
-- Assesses performance and fairness across subgroups (age, HIV status, nutritional status, sex)  
-- Provides an interactive **single-patient risk calculator** for demonstration
-  and educational purposes  
-        """
-    )
+    st.subheader("Scope of the prototype")
+    st.markdown(f"""
+- Synthetic cohort (~1 500 children) using WHO-inspired distributions  
+- Multiple models compared; **calibrated XGBoost** selected  
+- Operating threshold ≈ **{threshold:.3f}**, prioritising sensitivity  
+- Subgroup fairness evaluated (age, HIV, malnutrition, sex)  
+- Includes an interactive single-patient calculator  
+""")
 
     st.info(
-        "Important: This is a research and teaching prototype built on synthetic data. "
-        "It is not a medical device, has not been clinically validated, and must not be "
-        "used to guide real patient care."
+        "This is a research and teaching prototype based on synthetic data. "
+        "It is not clinically validated and must not be used for patient care."
     )
 
 
 # -------------------------------------------------------------------
-# Page 2: Single-patient risk calculator
+# Risk calculator page
 # -------------------------------------------------------------------
 
-def page_single_patient(model, feature_order, threshold: float, example_patient: dict):
+def page_single_patient(model, feature_order, threshold, example_patient):
     st.title("Single-Patient Risk Calculator")
 
-    st.markdown(
-        """
-This page allows users to specify the clinical and epidemiological profile of a child
-with presumptive TB and obtain the model’s **predicted risk** of tuberculosis,
-together with the associated decision at the current operating threshold.
-        """
-    )
+    st.markdown("""
+Specify the clinical profile of a child with presumptive TB to obtain
+a risk estimate and model decision at the current operating threshold.
+""")
 
     ep = example_patient
 
-    with st.form("tb_risk_form"):
-        st.subheader("Clinical and epidemiological inputs")
+    with st.form("tb_form"):
+        st.subheader("Clinical parameters")
 
         col1, col2 = st.columns(2)
 
         with col1:
-            age_years = st.slider(
-                "Age (years)",
-                min_value=0,
-                max_value=15,
-                value=int(ep.get("age_years", 7)),
+            age = st.slider("Age (years)", 0, 15, ep.get("age_years", 7))
+            sex_opt = st.selectbox(
+                "Sex", ["Female (0)", "Male (1)"], index=ep.get("sex", 0)
             )
-            sex_label = st.selectbox(
-                "Sex",
-                options=["Female (0)", "Male (1)"],
-                index=int(ep.get("sex", 0)),
-            )
-            sex = 1 if "Male" in sex_label else 0
+            sex = 1 if "Male" in sex_opt else 0
 
             cough_weeks = st.slider(
-                "Cough duration (weeks)",
-                min_value=0,
-                max_value=8,
-                value=int(ep.get("cough_weeks", 3)),
+                "Cough duration (weeks)", 0, 8, ep.get("cough_weeks", 3)
             )
-
-            weight_zscore = st.slider(
+            weight_z = st.slider(
                 "Weight-for-age z-score",
-                min_value=-4.0,
-                max_value=3.0,
-                value=float(ep.get("weight_zscore", -2.0)),
+                -4.0,
+                3.0,
+                ep.get("weight_zscore", -2.0),
                 step=0.1,
             )
 
-            malnutrition_label = st.selectbox(
-                "Moderate or severe malnutrition",
-                options=["No (0)", "Yes (1)"],
-                index=int(ep.get("malnutrition", 1)),
+            maln_opt = st.selectbox(
+                "Malnutrition (moderate/severe)",
+                ["No (0)", "Yes (1)"],
+                index=ep.get("malnutrition", 1),
             )
-            malnutrition = 1 if "Yes" in malnutrition_label else 0
+            maln = 1 if "Yes" in maln_opt else 0
 
         with col2:
-            fever_label = st.selectbox(
-                "Fever",
-                options=["No (0)", "Yes (1)"],
-                index=int(ep.get("fever", 1)),
+            fever_opt = st.selectbox(
+                "Fever", ["No (0)", "Yes (1)"], index=ep.get("fever", 1)
             )
-            fever = 1 if "Yes" in fever_label else 0
+            fever = 1 if "Yes" in fever_opt else 0
 
-            night_sweats_label = st.selectbox(
-                "Night sweats",
-                options=["No (0)", "Yes (1)"],
-                index=int(ep.get("night_sweats", 1)),
+            night_opt = st.selectbox(
+                "Night sweats", ["No (0)", "Yes (1)"], index=ep.get("night_sweats", 1)
             )
-            night_sweats = 1 if "Yes" in night_sweats_label else 0
+            night = 1 if "Yes" in night_opt else 0
 
-            contact_label = st.selectbox(
-                "Known household or close contact with TB",
-                options=["No (0)", "Yes (1)"],
-                index=int(ep.get("contact_TB", 1)),
+            contact_opt = st.selectbox(
+                "TB contact (household/close)",
+                ["No (0)", "Yes (1)"],
+                index=ep.get("contact_TB", 1),
             )
-            contact_TB = 1 if "Yes" in contact_label else 0
+            contact = 1 if "Yes" in contact_opt else 0
 
-            hiv_label = st.selectbox(
+            hiv_opt = st.selectbox(
                 "HIV-positive",
-                options=["No (0)", "Yes (1)"],
-                index=int(ep.get("HIV_positive", 0)),
+                ["No (0)", "Yes (1)"],
+                index=ep.get("HIV_positive", 0),
             )
-            HIV_positive = 1 if "Yes" in hiv_label else 0
+            hiv = 1 if "Yes" in hiv_opt else 0
 
-            bcg_label = st.selectbox(
-                "BCG scar present",
-                options=["No (0)", "Yes (1)"],
-                index=int(ep.get("BCG_scar", 1)),
-            )
-            BCG_scar = 1 if "Yes" in bcg_label else 0
-
-            cxr_label = st.selectbox(
+            cxr_opt = st.selectbox(
                 "Chest X-ray abnormal",
-                options=["No (0)", "Yes (1)"],
-                index=int(ep.get("CXR_abnormal", 1)),
+                ["No (0)", "Yes (1)"],
+                index=ep.get("CXR_abnormal", 1),
             )
-            CXR_abnormal = 1 if "Yes" in cxr_label else 0
+            cxr = 1 if "Yes" in cxr_opt else 0
 
-            gx_label = st.selectbox(
+            gx_opt = st.selectbox(
                 "GeneXpert available",
-                options=["No (0)", "Yes (1)"],
-                index=int(ep.get("GeneXpert_available", 0)),
+                ["No (0)", "Yes (1)"],
+                index=ep.get("GeneXpert_available", 0),
             )
-            GeneXpert_available = 1 if "Yes" in gx_label else 0
+            gx = 1 if "Yes" in gx_opt else 0
 
         submitted = st.form_submit_button("Estimate tuberculosis risk")
 
     if not submitted:
-        st.caption("Specify the input parameters above and click "
+        st.caption("Fill the fields above and click "
                    "\"Estimate tuberculosis risk\" to obtain a prediction.")
         return
 
-    user_inputs = {
-        "age_years": age_years,
+    inputs = {
+        "age_years": age,
         "sex": sex,
         "cough_weeks": cough_weeks,
         "fever": fever,
-        "night_sweats": night_sweats,
-        "contact_TB": contact_TB,
-        "HIV_positive": HIV_positive,
-        "weight_zscore": weight_zscore,
-        "malnutrition": malnutrition,
-        "BCG_scar": BCG_scar,
-        "CXR_abnormal": CXR_abnormal,
-        "GeneXpert_available": GeneXpert_available,
+        "night_sweats": night,
+        "contact_TB": contact,
+        "HIV_positive": hiv,
+        "weight_zscore": weight_z,
+        "malnutrition": maln,
+        "BCG_scar": ep.get("BCG_scar"),
+        "CXR_abnormal": cxr,
+        "GeneXpert_available": gx,
     }
 
-    X_row = build_input_df(user_inputs, feature_order)
-
-    prob = predict_risk(model, X_row)
-    label = int(prob >= threshold)
+    X = build_input_df(inputs, feature_order)
+    prob = predict_risk(model, X)
+    label = "TB-positive" if prob >= threshold else "TB-negative"
     interpretation = interpret_risk(prob)
+    band_label, band_color = risk_band(prob)
 
-    st.subheader("Model output")
+    log_prediction(inputs, prob, label, threshold)
+
+    st.subheader("Model Output")
+
+    # Risk band panel
+    st.markdown(
+        f"""
+<div style="
+    border-left: 6px solid {band_color};
+    border-radius: 4px;
+    padding: 8px 12px;
+    background-color: #f8f9fa;
+">
+<strong>Risk band: {band_label}</strong><br>
+Predicted probability of tuberculosis: <strong>{prob*100:.1f}%</strong><br>
+Interpretation: <strong>{interpretation}</strong>
+</div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     colA, colB = st.columns(2)
 
     with colA:
-        st.metric(
-            "Predicted probability of tuberculosis",
-            f"{prob*100:.1f} %",
-        )
-        st.write(f"Risk interpretation: **{interpretation}**")
+        st.metric("Predicted probability", f"{prob*100:.1f}%")
+        st.write(f"Risk category: **{interpretation}**")
 
     with colB:
-        decision_text = (
-            "Classified as TB-positive (probability above threshold)"
-            if label == 1
-            else "Classified as TB-negative (probability below threshold)"
+        st.metric("Model decision", label, help=f"Threshold = {threshold:.3f}")
+
+    # Explanation section (SHAP-like contributions)
+    st.subheader("Model explanation (feature contributions)")
+
+    xgb_model = get_underlying_xgb(model)
+    contrib_df = None
+    if xgb_model is not None:
+        contrib_df = shap_like_contributions(xgb_model, X, feature_order)
+
+    if contrib_df is not None:
+        top_k = contrib_df.head(8).copy()
+        st.markdown("Top contributing features for this prediction:")
+        st.dataframe(
+            top_k[["feature", "contribution"]],
+            use_container_width=True,
         )
-        st.metric(
-            "Model decision at current operating threshold",
-            decision_text,
-            help=f"Current threshold: {threshold:.3f}",
+        st.bar_chart(
+            top_k.set_index("feature")["contribution"],
+            use_container_width=True,
         )
+    else:
+        st.caption(
+            "Feature-level contributions are not available for this model configuration."
+        )
+
+    # Downloadable report
+    st.subheader("Downloadable report")
+    report_html = build_html_report(
+        inputs, prob, label, threshold, interpretation
+    )
+    st.download_button(
+        label="Download patient report (HTML, PDF-ready)",
+        data=report_html,
+        file_name="tb_risk_report.html",
+        mime="text/html",
+    )
 
     st.info(
-        "This output is generated from a model trained entirely on synthetic data. "
-        "In real settings, any similar tool would require rigorous clinical validation, "
-        "regulatory review, and integration with local clinical guidelines."
+        "Predictions and explanations are based entirely on synthetic training data. "
+        "In real-world settings, such tools require extensive clinical validation "
+        "and regulatory review."
     )
 
 
 # -------------------------------------------------------------------
-# Page 3: Model performance and figures
+# Performance page
 # -------------------------------------------------------------------
 
-def page_performance(summary_text: str | None):
-    st.title("Model Performance and Fairness Assessment")
-
-    st.markdown(
-        """
-This page summarises the performance of the final calibrated model on the
-synthetic test set and highlights diagnostic plots and subgroup analyses.
-        """
-    )
+def page_performance(summary_text):
+    st.title("Model Performance and Fairness")
 
     if summary_text:
-        st.subheader("Textual summary of results")
-        st.code(summary_text, language="text")
+        st.subheader("Summary")
+        st.code(summary_text)
     else:
-        st.warning(
-            "No results summary file (results_summary.txt) was found in the project root."
-        )
+        st.warning("results_summary.txt not found.")
 
-    st.subheader("Diagnostic plots")
+    st.subheader("Diagnostic Plots")
 
-    roc_path = os.path.join(FIG_DIR, "roc_curve_test.png")
-    calib_path = os.path.join(FIG_DIR, "calibration_curve_test.png")
-    subgroup_path = os.path.join(FIG_DIR, "subgroup_auc_bar.png")
-    uncert_path = os.path.join(FIG_DIR, "uncertainty_hist.png")
+    figs = {
+        "ROC curve (test set)": "roc_curve_test.png",
+        "Calibration curve (test set)": "calibration_curve_test.png",
+        "Subgroup AUROC": "subgroup_auc_bar.png",
+        "Uncertainty distribution": "uncertainty_hist.png",
+    }
 
-    if os.path.exists(roc_path):
-        st.markdown("**Receiver operating characteristic (ROC) curve – test set**")
-        st.image(roc_path, use_column_width=True)
-    else:
-        st.caption("ROC curve image not found in 'figures/roc_curve_test.png'.")
-
-    if os.path.exists(calib_path):
-        st.markdown("**Calibration curve – test set**")
-        st.image(calib_path, use_column_width=True)
-    else:
-        st.caption("Calibration curve image not found in 'figures/calibration_curve_test.png'.")
-
-    if os.path.exists(subgroup_path):
-        st.markdown("**AUROC by subgroup (age, HIV status, nutritional status, sex)**")
-        st.image(subgroup_path, use_column_width=True)
-    else:
-        st.caption("Subgroup AUROC figure not found in 'figures/subgroup_auc_bar.png'.")
-
-    if os.path.exists(uncert_path):
-        st.markdown("**Distribution of prediction uncertainty**")
-        st.image(uncert_path, use_column_width=True)
-    else:
-        st.caption("Uncertainty histogram not found in 'figures/uncertainty_hist.png'.")
+    for title, fname in figs.items():
+        path = os.path.join(FIG_DIR, fname)
+        if os.path.exists(path):
+            st.markdown(f"**{title}**")
+            # use_container_width=True avoids the deprecation warning
+            st.image(path, use_container_width=True)
+        else:
+            st.caption(f"{fname} not found in 'figures/'.")
 
 
 # -------------------------------------------------------------------
-# Page 4: Methods and limitations
+# Methods page
 # -------------------------------------------------------------------
 
 def page_methods():
-    st.title("Methods, Data Generation and Limitations")
+    st.title("Methods and Limitations")
 
-    st.subheader("Synthetic cohort design")
-    st.markdown(
-        """
-- Cohort size of approximately **1 500 children** aged 0–15 years  
-- Features sampled from distributions motivated by **WHO childhood TB guidance**  
-- Tuberculosis labels generated via a **latent logistic risk model** such that
-  high-risk profiles (e.g. TB contact, HIV-positivity, abnormal chest X-ray,
-  malnutrition) are more likely to be TB-positive  
-- Overall TB prevalence in the synthetic dataset around **20–25 %**, reflecting
-  a high-risk presumptive TB population  
-        """
-    )
+    st.subheader("Synthetic Cohort")
+    st.markdown("""
+- ~1500 children aged 0–15  
+- WHO-inspired feature distributions  
+- TB labels via latent logistic model  
+- Prevalence ≈ 20–25%  
+""")
 
-    st.subheader("Models and training approach")
-    st.markdown(
-        """
-- Compared several models, including **logistic regression, random forests, XGBoost and LightGBM**  
-- Selected **XGBoost** as the final model based on discrimination, calibration
-  and stability on the synthetic test set  
-- Applied **isotonic regression** for probability calibration  
-- Defined an operating threshold using **Youden’s J statistic**, constrained to
-  maintain **high sensitivity** in line with clinical priorities  
-- Evaluated performance across subgroups (age bands, HIV status, malnutrition, sex)
-  to assess potential fairness concerns  
-        """
-    )
+    st.subheader("Model Approach")
+    st.markdown("""
+- Logistic regression, Random Forest, XGBoost, LightGBM evaluated  
+- **Calibrated XGBoost** selected  
+- Probability calibration via isotonic regression  
+- Threshold chosen using Youden’s J  
+- Subgroup fairness checked (age, HIV, malnutrition, sex)  
+""")
 
-    st.subheader("Key limitations")
-    st.markdown(
-        """
-- The dataset is **fully synthetic**; real-world performance may differ substantially  
-- No detailed imaging, microbiology or longitudinal treatment data are included  
-- The prototype does **not** incorporate drug resistance, previous TB history or
-  other co-morbidities  
-- The application has **not** undergone clinical validation or regulatory review  
-        """
-    )
-
-    st.subheader("Future directions")
-    st.markdown(
-        """
-- External validation on **real, multicountry paediatric TB datasets**  
-- Co-design with clinicians to refine decision thresholds, explanations and workflow integration  
-- Incorporation into a broader **clinical decision support framework** with clear
-  governance, audit logging and training  
-        """
-    )
+    st.subheader("Limitations")
+    st.markdown("""
+- Fully synthetic data  
+- No imaging or microbiology data  
+- Not clinically validated  
+- Not a medical device  
+""")
 
     st.info(
-        "This project illustrates how a junior data scientist can design a transparent, "
-        "calibrated and fairness-aware risk prediction prototype for a high-impact "
-        "clinical question, using only synthetic data and open-source tools."
+        "This prototype demonstrates transparent and calibrated risk modelling "
+        "for an important paediatric health problem using only synthetic data."
     )
 
 
 # -------------------------------------------------------------------
-# Application entry point
+# Main entry
 # -------------------------------------------------------------------
 
 def main():
     st.set_page_config(
-        page_title="Childhood Tuberculosis Risk Prototype",
-        page_icon=None,
+        page_title="Childhood TB Risk Prototype",
         layout="centered",
     )
 
-    # Sidebar: project information and navigation
-    st.sidebar.title("Childhood TB Risk Prototype")
-    st.sidebar.markdown(
+    # Simple WHO-like blue/grey styling
+    st.markdown(
         """
+<style>
+    .stApp {
+        background-color: #f5f7fa;
+    }
+    h1, h2, h3 {
+        color: #005eb8;
+    }
+</style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.sidebar.title("Childhood TB Risk Prototype")
+    st.sidebar.markdown("""
 **Version:** 1.0  
 **Author:** Nahimana Emmanuel  
 
-This prototype demonstrates calibrated risk prediction for childhood TB
-using synthetic data. It is intended for research and educational use only.
-        """
-    )
+Research and educational prototype for calibrated TB risk prediction
+using synthetic data.
+""")
 
-    calibrated_model, feature_order, threshold, example_patient, summary_text = load_artifacts()
+    model, feat_order, thr, example, summary = load_artifacts()
 
     page = st.sidebar.radio(
         "Navigation",
-        options=[
-            "Overview",
-            "Risk calculator",
-            "Performance",
-            "Methods and limitations",
-        ],
+        ["Overview", "Risk calculator", "Performance", "Methods and limitations"],
     )
 
     if page == "Overview":
-        page_overview(threshold)
+        page_overview(thr)
     elif page == "Risk calculator":
-        page_single_patient(calibrated_model, feature_order, threshold, example_patient)
+        page_single_patient(model, feat_order, thr, example)
     elif page == "Performance":
-        page_performance(summary_text)
-    elif page == "Methods and limitations":
+        page_performance(summary)
+    else:
         page_methods()
 
-    # Footer
     st.markdown(
         """
 <hr>
 <small>
-This application is a research and teaching prototype built on synthetic data.  
-It does not constitute medical advice and must not be used to guide individual patient care.
+This prototype is built on synthetic data and is not intended for clinical use.
+It is presented for research and teaching purposes only.
 </small>
         """,
         unsafe_allow_html=True,
