@@ -377,6 +377,14 @@ a risk estimate and model decision at the current operating threshold.
             )
             gx = 1 if "Yes" in gx_opt else 0
 
+            # NEW: interactive BCG scar input
+            bcg_opt = st.selectbox(
+                "BCG scar present",
+                ["No (0)", "Yes (1)"],
+                index=ep.get("BCG_scar", 1),
+            )
+            bcg_scar = 1 if "Yes" in bcg_opt else 0
+
         submitted = st.form_submit_button("Estimate tuberculosis risk")
 
     if not submitted:
@@ -394,7 +402,7 @@ a risk estimate and model decision at the current operating threshold.
         "HIV_positive": hiv,
         "weight_zscore": weight_z,
         "malnutrition": maln,
-        "BCG_scar": ep.get("BCG_scar"),
+        "BCG_scar": bcg_scar,
         "CXR_abnormal": cxr,
         "GeneXpert_available": gx,
     }
